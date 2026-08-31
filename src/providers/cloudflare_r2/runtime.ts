@@ -424,10 +424,11 @@ async function putObject(input: Record<string, unknown>, context: CloudflareR2Co
   if (!response.ok || envelope.success === false) {
     throw normalizeCloudflareR2Error(response, envelope, "execute");
   }
+  const resultRecord = optionalRecord(envelope.result);
   return {
     bucketName,
     objectKey,
-    etag: optionalString(response.headers.get("etag")) ?? null,
+    etag: optionalString(resultRecord?.etag) ?? optionalString(response.headers.get("etag")) ?? null,
   };
 }
 

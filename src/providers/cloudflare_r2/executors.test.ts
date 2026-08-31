@@ -542,9 +542,7 @@ function createTransitFileStore(maxBytes: number): {
 
 describe("Cloudflare R2 put_object", () => {
   it("uploads contentText into the bucket object path", async () => {
-    const requests = stubResponses([
-      Response.json({ success: true, result: {} }, { headers: { etag: '"etag-put-1"' } }),
-    ]);
+    const requests = stubResponses([Response.json({ success: true, result: { etag: '"etag-put-1"' } })]);
 
     const result = await executePut({ bucketName: "documents", objectKey: "notes/hello.txt", contentText: "hello" });
 
@@ -560,7 +558,7 @@ describe("Cloudflare R2 put_object", () => {
   });
 
   it("uploads base64 content with contentType and jurisdiction headers", async () => {
-    const requests = stubResponses([Response.json({ success: true, result: {} }, { headers: { etag: '"etag-b64"' } })]);
+    const requests = stubResponses([Response.json({ success: true, result: { etag: '"etag-b64"' } })]);
 
     const result = await executePut({
       bucketName: "documents",

@@ -324,7 +324,7 @@ export const cloudflareR2Actions: ActionDefinition[] = [
           optional: ["accountId", "jurisdiction", "sourceUrl", "contentText", "contentBase64", "contentType"],
         },
       ),
-      anyOf: [{ required: ["sourceUrl"] }, { required: ["contentText"] }, { required: ["contentBase64"] }],
+      oneOf: [{ required: ["sourceUrl"] }, { required: ["contentText"] }, { required: ["contentBase64"] }],
     } as JsonSchema,
     outputSchema: s.object("The output payload for this action.", {
       bucketName: s.string("The bucket that received the object."),
