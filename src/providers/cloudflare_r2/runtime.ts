@@ -5,6 +5,7 @@ import type { ProviderRuntimeHandler } from "../provider-runtime.ts";
 import type { CloudflareR2PresignedMethod } from "./s3-presign.ts";
 
 import {
+  base64Bytes,
   compactObject,
   integer,
   optionalInteger,
@@ -15,7 +16,13 @@ import {
 } from "../../core/cast.ts";
 import { assertPublicHttpUrl, queryParams, readBoundedResponseBytes } from "../../core/request.ts";
 import { readCloudflareCurrentUser } from "../cloudflare-current-user.ts";
-import { providerFetch, providerInputError, ProviderRequestError, providerUserAgent } from "../provider-runtime.ts";
+import {
+  providerFetch,
+  providerInputError,
+  ProviderRequestError,
+  providerUserAgent,
+  runProviderRequest,
+} from "../provider-runtime.ts";
 import { createCloudflareR2PresignedUrl, deriveCloudflareR2S3SecretAccessKey } from "./s3-presign.ts";
 
 export interface CloudflareR2Context {
@@ -392,13 +399,14 @@ async function putObject(input: Record<string, unknown>, context: CloudflareR2Co
   const accountId = resolveAccountId(input, context);
   const bucketName = requiredString(input.bucketName, "bucketName", providerInputError);
   const objectKey = readObjectKey(input);
-  const sourceUrl = optionalString(input.sourceUrl);
+  const sourceUrl =
+    input.sourceUrl != null ? requiredString(input.sourceUrl, "sourceUrl", providerInputError) : undefined;
   const sourceFile = sourceUrl ? await downloadSourceFile(sourceUrl, context.signal) : null;
-  const resolvedContentType = optionalString(input.contentType) ?? sourceFile?.contentType;
-  const body = sourceFile?.bytes
-    ? Buffer.from(sourceFile.bytes)
-    : optionalString(input.contentBase64) != null
-      ? Buffer.from(String(input.contentBase64), "base64")
+  const resolvedContentType = normalizeContentType(input.contentType) ?? sourceFile?.contentType;
+  const body = sourceFile
+    ? Uint8Array.from(sourceFile.bytes)
+    : input.contentBase64 != null
+      ? base64Bytes(input.contentBase64, "contentBase64", providerInputError)
       : Buffer.from(String(input.contentText ?? ""), "utf8");
   const headers: Record<string, string | undefined> = {
     ...buildJurisdictionHeaders(input),
@@ -428,8 +436,20 @@ async function putObject(input: Record<string, unknown>, context: CloudflareR2Co
   return {
     bucketName,
     objectKey,
-    etag: optionalString(resultRecord?.etag) ?? optionalString(response.headers.get("etag")) ?? null,
+    etag: normalizeEtag(optionalString(resultRecord?.etag) ?? optionalString(response.headers.get("etag"))),
   };
+}
+
+// R2 returns a bare hex ETag in the JSON envelope and a quoted one in the HTTP
+// header, so both fallback paths have to converge on the same unquoted form.
+function normalizeEtag(value: string | undefined): string | null {
+  if (!value) {
+    return null;
+  }
+  if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+    return value.slice(1, -1);
+  }
+  return value;
 }
 
 async function downloadSourceFile(
@@ -438,59 +458,26 @@ async function downloadSourceFile(
 ): Promise<{ bytes: Uint8Array; contentType?: string }> {
   const validatedUrl = assertPublicHttpUrl(sourceUrl, {
     fieldName: "sourceUrl",
-    createError: (message: string) => new ProviderRequestError(400, message),
+    createError: providerInputError,
   });
-  const timeoutSignal = AbortSignal.timeout(sourceFetchTimeoutMs);
-  const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
-  const response = await providerFetch(validatedUrl, { signal: requestSignal });
-  const contentLength = parseHeaderInteger(response.headers.get("content-length") ?? undefined);
-  if (contentLength != null && contentLength > maxSourceBytes) {
-    throw new ProviderRequestError(400, "sourceUrl payload is too large");
-  }
-  if (!response.ok) {
-    throw new ProviderRequestError(
-      response.status >= 500 ? 502 : response.status,
-      `failed to download sourceUrl: ${response.status} ${response.statusText}`.trim(),
-    );
-  }
-  const bytes = await readResponseBytesWithLimit(response, maxSourceBytes);
-  return {
-    bytes,
-    contentType: response.headers.get("content-type") ?? undefined,
-  };
-}
-
-async function readResponseBytesWithLimit(response: Response, limit: number): Promise<Uint8Array> {
-  const reader = response.body?.getReader();
-  if (!reader) {
-    return new Uint8Array(0);
-  }
-  const chunks: Uint8Array[] = [];
-  let totalBytes = 0;
-  while (true) {
-    const result = await reader.read();
-    if (result.done) break;
-    if (!result.value) continue;
-    totalBytes += result.value.byteLength;
-    if (totalBytes > limit) {
-      await reader.cancel("sourceUrl payload is too large").catch(() => {});
-      throw new ProviderRequestError(400, "sourceUrl payload is too large");
+  return runProviderRequest({ signal, timeoutMs: sourceFetchTimeoutMs, label: "sourceUrl" }, async (requestSignal) => {
+    const response = await providerFetch(validatedUrl, { signal: requestSignal });
+    if (!response.ok) {
+      // An upstream 401/403 is not our authorization failure, so it must not
+      // pass through as this action's own status.
+      const message = `failed to download sourceUrl: ${response.status} ${response.statusText}`.trim();
+      throw response.status >= 500 ? new ProviderRequestError(502, message) : providerInputError(message);
     }
-    chunks.push(result.value);
-  }
-  const out = new Uint8Array(totalBytes);
-  let offset = 0;
-  for (const chunk of chunks) {
-    out.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return out;
-}
-
-function parseHeaderInteger(value: string | undefined): number | undefined {
-  if (!value) return undefined;
-  const parsed = Number.parseInt(value, 10);
-  return Number.isFinite(parsed) ? parsed : undefined;
+    const bytes = await readBoundedResponseBytes(response, {
+      maxBytes: maxSourceBytes,
+      fieldName: "sourceUrl",
+      createError: providerInputError,
+    });
+    return {
+      bytes,
+      contentType: response.headers.get("content-type") ?? undefined,
+    };
+  });
 }
 
 async function generatePresignedUrl(input: Record<string, unknown>, context: CloudflareR2Context): Promise<unknown> {

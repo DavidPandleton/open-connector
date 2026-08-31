@@ -314,9 +314,15 @@ export const cloudflareR2Actions: ActionDefinition[] = [
           bucketName: bucketNameSchema,
           objectKey: s.nonEmptyString("The complete R2 object key. Slashes are preserved as key delimiters."),
           jurisdiction: jurisdictionSchema,
-          sourceUrl: s.url("A public URL that the connector can fetch and upload to R2."),
-          contentText: s.string("The plain-text content to upload."),
-          contentBase64: s.string("Base64-encoded binary content to upload."),
+          sourceUrl: s.url(
+            "A public URL that the connector can fetch and upload to R2. Provide exactly one of sourceUrl, contentText, or contentBase64.",
+          ),
+          contentText: s.string(
+            "The plain-text content to upload. Provide exactly one of sourceUrl, contentText, or contentBase64.",
+          ),
+          contentBase64: s.string(
+            "Base64-encoded binary content to upload. Provide exactly one of sourceUrl, contentText, or contentBase64.",
+          ),
           contentType: s.string("The Content-Type header to store on the object."),
         },
         {
