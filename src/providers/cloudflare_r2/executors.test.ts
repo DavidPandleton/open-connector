@@ -540,6 +540,69 @@ function createTransitFileStore(maxBytes: number): {
   };
 }
 
+describe("Cloudflare R2 put_object", () => {
+  it("uploads contentText into the bucket object path", async () => {
+    const requests = stubResponses([
+      Response.json({ success: true, result: {} }, { headers: { etag: '"etag-put-1"' } }),
+    ]);
+
+    const result = await executePut({ bucketName: "documents", objectKey: "notes/hello.txt", contentText: "hello" });
+
+    expect(result).toEqual({
+      ok: true,
+      output: { bucketName: "documents", objectKey: "notes/hello.txt", etag: '"etag-put-1"' },
+    });
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.url.pathname).toBe(
+      "/client/v4/accounts/account-1/r2/buckets/documents/objects/notes/hello.txt",
+    );
+    expect(requests[0]?.authorization).toBe("Bearer cloudflare-access-token");
+  });
+
+  it("uploads base64 content with contentType and jurisdiction headers", async () => {
+    const requests = stubResponses([Response.json({ success: true, result: {} }, { headers: { etag: '"etag-b64"' } })]);
+
+    const result = await executePut({
+      bucketName: "documents",
+      objectKey: "notes/hello.txt",
+      contentBase64: Buffer.from("hello").toString("base64"),
+      contentType: "text/plain",
+      jurisdiction: "eu",
+    });
+
+    expect(result).toMatchObject({ ok: true, output: { bucketName: "documents", etag: '"etag-b64"' } });
+    expect(requests[0]?.jurisdiction).toBe("eu");
+  });
+
+  it("rejects dot segments before any network request", async () => {
+    const fetch = vi.fn();
+    vi.stubGlobal("fetch", fetch);
+
+    const result = await executePut({ bucketName: "documents", objectKey: "a/../secret", contentText: "hi" });
+
+    expect(result).toMatchObject({
+      ok: false,
+      error: { code: "invalid_input", message: "objectKey must not contain . or .. path segments" },
+    });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("rejects private sourceUrl without touching the private-aware fetcher", async () => {
+    const fetch = vi.fn(async () => new Response("ok"));
+    vi.stubGlobal("fetch", fetch);
+
+    const result = await executePut({
+      bucketName: "documents",
+      objectKey: "notes/hello.txt",
+      sourceUrl: "http://127.0.0.1/secret",
+    });
+
+    expect(result).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+    // The relay validator uses assertPublicHttpUrl, so it should fail without a providerFetch success path
+    expect(fetch).not.toHaveBeenCalled();
+  });
+});
+
 async function executeDownload(input: Record<string, unknown>, transitFiles?: TransitFileStore) {
   const context: ExecutionContext = {
     getCredential: async (service) => {
@@ -561,6 +624,16 @@ async function executePresign(input: Record<string, unknown>, credential: Resolv
     },
   };
   return executors["cloudflare_r2.generate_presigned_url"]!(input, context);
+}
+
+async function executePut(input: Record<string, unknown>, credential: ResolvedCredential = oauthCredential) {
+  const context: ExecutionContext = {
+    getCredential: async (service) => {
+      expect(service).toBe("cloudflare_r2");
+      return credential;
+    },
+  };
+  return executors["cloudflare_r2.put_object"]!(input, context);
 }
 
 function readPresignedOutput(result: { ok: boolean; output?: unknown }): Record<string, unknown> {

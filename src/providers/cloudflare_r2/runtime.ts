@@ -13,9 +13,9 @@ import {
   requiredRawString,
   requiredString,
 } from "../../core/cast.ts";
-import { queryParams, readBoundedResponseBytes } from "../../core/request.ts";
+import { assertPublicHttpUrl, queryParams, readBoundedResponseBytes } from "../../core/request.ts";
 import { readCloudflareCurrentUser } from "../cloudflare-current-user.ts";
-import { providerInputError, ProviderRequestError, providerUserAgent } from "../provider-runtime.ts";
+import { providerFetch, providerInputError, ProviderRequestError, providerUserAgent } from "../provider-runtime.ts";
 import { createCloudflareR2PresignedUrl, deriveCloudflareR2S3SecretAccessKey } from "./s3-presign.ts";
 
 export interface CloudflareR2Context {
@@ -85,6 +85,9 @@ export const cloudflareR2ActionHandlers: ProviderActionHandlers<
   },
   delete_bucket_cors_policy(input, context) {
     return deleteBucketCorsPolicy(input, context);
+  },
+  put_object(input, context) {
+    return putObject(input, context);
   },
   generate_presigned_url(input, context) {
     return generatePresignedUrl(input, context);
@@ -381,6 +384,113 @@ async function deleteBucketCorsPolicy(input: Record<string, unknown>, context: C
 
 const defaultPresignExpiresSeconds = 3600;
 const maxPresignExpiresSeconds = 604800;
+
+const maxSourceBytes = 20 * 1024 * 1024;
+const sourceFetchTimeoutMs = 15_000;
+
+async function putObject(input: Record<string, unknown>, context: CloudflareR2Context): Promise<unknown> {
+  const accountId = resolveAccountId(input, context);
+  const bucketName = requiredString(input.bucketName, "bucketName", providerInputError);
+  const objectKey = readObjectKey(input);
+  const sourceUrl = optionalString(input.sourceUrl);
+  const sourceFile = sourceUrl ? await downloadSourceFile(sourceUrl, context.signal) : null;
+  const resolvedContentType = optionalString(input.contentType) ?? sourceFile?.contentType;
+  const body = sourceFile?.bytes
+    ? Buffer.from(sourceFile.bytes)
+    : optionalString(input.contentBase64) != null
+      ? Buffer.from(String(input.contentBase64), "base64")
+      : Buffer.from(String(input.contentText ?? ""), "utf8");
+  const headers: Record<string, string | undefined> = {
+    ...buildJurisdictionHeaders(input),
+    "content-type": resolvedContentType,
+  };
+  const response = await context.fetcher(
+    buildCloudflareR2Url(
+      `/accounts/${encodeURIComponent(accountId)}/r2/buckets/${encodeURIComponent(bucketName)}/objects/${encodeR2ObjectKey(objectKey)}`,
+    ),
+    {
+      method: "PUT",
+      headers: compactObject({
+        accept: "application/json",
+        authorization: `Bearer ${context.accessToken}`,
+        "user-agent": providerUserAgent,
+        ...headers,
+      }),
+      body,
+      signal: context.signal,
+    },
+  );
+  const envelope = await readCloudflareR2Envelope(response);
+  if (!response.ok || envelope.success === false) {
+    throw normalizeCloudflareR2Error(response, envelope, "execute");
+  }
+  return {
+    bucketName,
+    objectKey,
+    etag: optionalString(response.headers.get("etag")) ?? null,
+  };
+}
+
+async function downloadSourceFile(
+  sourceUrl: string,
+  signal?: AbortSignal,
+): Promise<{ bytes: Uint8Array; contentType?: string }> {
+  const validatedUrl = assertPublicHttpUrl(sourceUrl, {
+    fieldName: "sourceUrl",
+    createError: (message: string) => new ProviderRequestError(400, message),
+  });
+  const timeoutSignal = AbortSignal.timeout(sourceFetchTimeoutMs);
+  const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+  const response = await providerFetch(validatedUrl, { signal: requestSignal });
+  const contentLength = parseHeaderInteger(response.headers.get("content-length") ?? undefined);
+  if (contentLength != null && contentLength > maxSourceBytes) {
+    throw new ProviderRequestError(400, "sourceUrl payload is too large");
+  }
+  if (!response.ok) {
+    throw new ProviderRequestError(
+      response.status >= 500 ? 502 : response.status,
+      `failed to download sourceUrl: ${response.status} ${response.statusText}`.trim(),
+    );
+  }
+  const bytes = await readResponseBytesWithLimit(response, maxSourceBytes);
+  return {
+    bytes,
+    contentType: response.headers.get("content-type") ?? undefined,
+  };
+}
+
+async function readResponseBytesWithLimit(response: Response, limit: number): Promise<Uint8Array> {
+  const reader = response.body?.getReader();
+  if (!reader) {
+    return new Uint8Array(0);
+  }
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  while (true) {
+    const result = await reader.read();
+    if (result.done) break;
+    if (!result.value) continue;
+    totalBytes += result.value.byteLength;
+    if (totalBytes > limit) {
+      await reader.cancel("sourceUrl payload is too large").catch(() => {});
+      throw new ProviderRequestError(400, "sourceUrl payload is too large");
+    }
+    chunks.push(result.value);
+  }
+  const out = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
+function parseHeaderInteger(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
 
 async function generatePresignedUrl(input: Record<string, unknown>, context: CloudflareR2Context): Promise<unknown> {
   if (context.authType !== "custom_credential") {
